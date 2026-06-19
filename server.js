@@ -3,7 +3,8 @@ import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import roomRoutes from './routes/room.js';
-import { connectDB } from './config/db.js';
+import { connectDB, getDB } from './config/db.js';
+import { ObjectId } from 'mongodb';
 
 const app = express();
 app.use(cors());
@@ -13,7 +14,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: "http://localhost:5173", 
+        origin: "http://localhost:5173",
         methods: ["GET", "POST"]
     }
 });
@@ -42,10 +43,17 @@ io.on('connection', (socket) => {
         return roomUsers.length;
     };
 
-    socket.on('join_room', ({ roomId, username }, callback) => {
+    socket.on('join_room', async ({ roomId, username }, callback) => {
+        const trimmedUsername = String(username || "").trim();
+        if (!trimmedUsername) {
+            if (callback) callback({ success: false, message: "Username cannot be empty." });
+            return;
+        }
+
+        const normalizedName = trimmedUsername.toLowerCase();
         let nameExists = false;
         activeUsers.forEach((userData) => {
-            if (userData.roomId === roomId && userData.username === username) {
+            if (userData.roomId === roomId && userData.normalizedName === normalizedName) {
                 nameExists = true;
             }
         });
@@ -54,23 +62,42 @@ io.on('connection', (socket) => {
             if (callback) callback({ success: false, message: "Username is already taken in this room." });
             return;
         }
-        
+
         socket.join(roomId);
+        socketUserMap.set(socket.id, { roomId, username: trimmedUsername });
+        activeUsers.set(socket.id, { roomId, username: trimmedUsername, normalizedName });
 
-        socketUserMap.set(socket.id, { roomId, username });
+        try {
+            const db = getDB();
 
-        activeUsers.set(socket.id, { roomId, username });
+            const previousMessages = await db.collection('messages')
+                .find({ roomId })
+                .sort({ timestamp: 1 })
+                .toArray();
 
-        socket.to(roomId).emit('receive_message', {
-            id: Date.now().toString(),
-            text: `${username} joined the chat`,
-            type: 'system'
-        });
+            socket.emit('load_messages', previousMessages);
 
-        broadcastRoomUsers(roomId);
-        if (callback) callback({ success: true });
+            const joinMessage = {
+                id: Date.now().toString(),
+                roomId,
+                text: `${username} joined the chat`,
+                type: 'system',
+                timestamp: new Date()
+            };
+
+            await db.collection('messages').insertOne(joinMessage);
+            socket.to(roomId).emit('receive_message', joinMessage);
+
+            broadcastRoomUsers(roomId);
+            if (callback) callback({ success: true });
+
+        } catch (error) {
+            console.error("Database error during join:", error);
+            if (callback) callback({ success: false, message: "Server error joining room." });
+        }
     });
 
+    // ALL OF THESE LISTENERS MUST LIVE INSIDE THE io.on('connection') BLOCK
     socket.on('typing', ({ roomId, username }) => {
         socket.to(roomId).emit('user_typing', { username });
     });
@@ -79,8 +106,21 @@ io.on('connection', (socket) => {
         socket.to(roomId).emit('user_stopped_typing', { username });
     });
 
-    socket.on('send_message', ({ roomId, message }) => {
-        socket.to(roomId).emit('receive_message', message);
+    socket.on('send_message', async ({ roomId, message }) => {
+        try {
+            const db = getDB();
+
+            const messageData = {
+                ...message,
+                roomId,
+                timestamp: new Date()
+            };
+
+            await db.collection('messages').insertOne(messageData);
+            socket.to(roomId).emit('receive_message', messageData);
+        } catch (error) {
+            console.error("Error saving message:", error);
+        }
     });
 
     socket.on('disconnect', async () => {
@@ -88,34 +128,41 @@ io.on('connection', (socket) => {
 
         if (userData) {
             const { roomId, username } = userData;
-            
+
             activeUsers.delete(socket.id);
-
-            socket.to(roomId).emit('user_stopped_typing', { username });
-
-            socket.to(roomId).emit('receive_message', {
-                id: Date.now().toString(),
-                text: `${username} left the chat`,
-                type: 'system'
-            });
-
             socketUserMap.delete(socket.id);
 
-            const remainingUsers = broadcastRoomUsers(roomId);
-         
-            if (remainingUsers === 0) {
-                console.log(`Room ${roomId} is completely empty. Cleaning up database...`);
-                try {
-                    // Replace 'Room' with whatever your Mongoose/Database model is named
-                    // Example: await Room.deleteOne({ roomId: roomId });
-                    console.log(`Room ${roomId} deleted successfully.`);
-                } catch (err) {
-                    console.error(`Error deleting empty room ${roomId}:`, err);
+            try {
+                const db = getDB();
+
+                const leaveMessage = {
+                    id: Date.now().toString(),
+                    roomId,
+                    text: `${username} left the chat`,
+                    type: 'system',
+                    timestamp: new Date()
+                };
+
+                await db.collection('messages').insertOne(leaveMessage);
+                socket.to(roomId).emit('receive_message', leaveMessage);
+                socket.to(roomId).emit('user_stopped_typing', { username });
+
+                const remainingUsers = broadcastRoomUsers(roomId);
+
+                if (remainingUsers === 0) {
+                    console.log(`Room ${roomId} is completely empty. Cleaning up database...`);
+
+                    await db.collection('rooms').deleteOne({ _id: new ObjectId(roomId) });
+                    await db.collection('messages').deleteMany({ roomId });
+
+                    console.log(`Room ${roomId} and its messages deleted successfully.`);
                 }
+            } catch (error) {
+                console.error("Error during disconnect cleanup:", error);
             }
         }
     });
-});
+}); // This closing bracket wraps everything up nicely
 
 const PORT = process.env.PORT || 3001;
 connectDB().then(() => {
