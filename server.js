@@ -97,7 +97,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ALL OF THESE LISTENERS MUST LIVE INSIDE THE io.on('connection') BLOCK
     socket.on('typing', ({ roomId, username }) => {
         socket.to(roomId).emit('user_typing', { username });
     });
@@ -162,7 +161,7 @@ io.on('connection', (socket) => {
             }
         }
     });
-}); // This closing bracket wraps everything up nicely
+});
 
 const PORT = process.env.PORT || 3001;
 connectDB().then(() => {
